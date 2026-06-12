@@ -318,7 +318,12 @@ class TemplateRepository(BaseRepository[CatalogTemplate]):
 
         如果其中一个模板项没有当前 entry 的 EC 行（空槽位），则将 EC 行
         的引用直接移到目标模板项，实现"移入空位"的效果。
+
+        占位 id（负数/零）直接拒绝：那是 UI 异步创建模板项期间的临时 id，
+        DB 里不存在对应记录，写入会触发外键约束错误。
         """
+        if int(template_item_id_a) <= 0 or int(template_item_id_b) <= 0:
+            return False
         with get_session() as session:
             ec_a = (
                 session.query(EntryCatalogItem)
