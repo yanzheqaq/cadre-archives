@@ -5013,7 +5013,8 @@ class InventoryEntryDialog(QDialog):
                 if not success:
                     continue
                 
-                # 在UI中交换位置
+                # 在UI中交换位置，并同步交换两节点携带的槽位信息
+                self._sync_items_after_slot_swap(item, sibling)
                 taken_item = parent.takeChild(index)
                 parent.insertChild(new_index, taken_item)
             
@@ -5324,6 +5325,36 @@ class InventoryEntryDialog(QDialog):
         
         update_node_and_children(self.catalog_tree.invisibleRootItem())
     
+    def _sync_items_after_slot_swap(self, item_a, item_b):
+        """DB 交换两个槽位的 EC 引用后，同步交换 UI 节点携带的槽位信息。
+
+        内容（EC 行 id、乐观锁基线）跟随节点不动；槽位信息（模板项 id、
+        模板预设序号/名称）随 DB 互换。同时交换 pending 队列中两个模板项
+        id 下的待保存字段，避免后续异步落盘写到对方的行上。
+        """
+        tpl_a = item_a.data(0, Qt.UserRole)
+        tpl_b = item_b.data(0, Qt.UserRole)
+        item_a.setData(0, Qt.UserRole, tpl_b)
+        item_b.setData(0, Qt.UserRole, tpl_a)
+        for col in (0, 1):
+            preset_a = item_a.data(col, Qt.UserRole + 10)
+            preset_b = item_b.data(col, Qt.UserRole + 10)
+            item_a.setData(col, Qt.UserRole + 10, preset_b)
+            item_b.setData(col, Qt.UserRole + 10, preset_a)
+        try:
+            pending_a = self._pending_catalog_saves.pop(tpl_a, None)
+            pending_b = self._pending_catalog_saves.pop(tpl_b, None)
+            if pending_a is not None:
+                self._pending_catalog_saves[tpl_b] = pending_a
+                if pending_a[2] and int(tpl_b) > 0:
+                    self._wal_stage(tpl_b, pending_a[2], pending_a[1])
+            if pending_b is not None:
+                self._pending_catalog_saves[tpl_a] = pending_b
+                if pending_b[2] and int(tpl_a) > 0:
+                    self._wal_stage(tpl_a, pending_b[2], pending_b[1])
+        except Exception as e:
+            print(f"[catalog-entry] swap pending keys failed: {e}")
+
     def _on_move_item(self, item, direction):
         """移动条目：direction=-1表示上移，1表示下移（单个项移动，保留用于兼容）"""
         if not item:
@@ -5365,8 +5396,9 @@ class InventoryEntryDialog(QDialog):
             StyledMessageBox.warning(self, "提示", f"移动失败：{e}", self.current_theme)
             return
         
-        # 在UI中交换位置
+        # 在UI中交换位置，并同步交换两节点携带的槽位信息
         self._suppress_catalog_changed = True
+        self._sync_items_after_slot_swap(item, sibling)
         taken_item = parent.takeChild(index)
         parent.insertChild(new_index, taken_item)
         self.catalog_tree.setCurrentItem(taken_item)
