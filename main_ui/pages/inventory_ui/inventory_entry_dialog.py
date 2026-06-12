@@ -1934,6 +1934,10 @@ class InventoryEntryDialog(QDialog):
             target_tpl_id = target_item.data(0, Qt.UserRole)
             if not current_tpl_id or not target_tpl_id:
                 return
+            # 占位 id（负数）：真实模板项后台创建中，DB 里还没有记录，交换会触发外键错误
+            if int(current_tpl_id) <= 0 or int(target_tpl_id) <= 0:
+                StyledMessageBox.information(self, "提示", "该目录正在保存中，请稍候再试", self.current_theme)
+                return
 
             # 调用 repo 层交换当前 entry 的 EC 行顺序
             try:
@@ -4975,6 +4979,7 @@ class InventoryEntryDialog(QDialog):
             items_with_index.sort(reverse=True)
         
         self._suppress_catalog_changed = True
+        has_placeholder = False
         try:
             from .repo.inventory_entry_repo import swap_entry_catalog_item_order
             
@@ -4992,6 +4997,11 @@ class InventoryEntryDialog(QDialog):
                 sibling_id = sibling.data(0, Qt.UserRole)
                 
                 if not current_id or not sibling_id:
+                    continue
+                
+                # 占位 id（负数）：真实模板项后台创建中，跳过避免外键错误
+                if int(current_id) <= 0 or int(sibling_id) <= 0:
+                    has_placeholder = True
                     continue
                 
                 # 交换当前 entry 的 EC 行顺序
@@ -5013,6 +5023,9 @@ class InventoryEntryDialog(QDialog):
             
             # 移动后更新同级节点的序号
             self._update_siblings_serial(parent)
+            
+            if has_placeholder:
+                StyledMessageBox.information(self, "提示", "部分目录正在保存中，请稍候再试", self.current_theme)
                 
         except Exception as e:
             print(f"[catalog-entry] batch move failed: {e}")
@@ -5329,6 +5342,11 @@ class InventoryEntryDialog(QDialog):
         sibling_id = sibling.data(0, Qt.UserRole)
         
         if not current_id or not sibling_id:
+            return
+        
+        # 占位 id（负数）：真实模板项后台创建中，DB 里还没有记录，交换会触发外键错误
+        if int(current_id) <= 0 or int(sibling_id) <= 0:
+            StyledMessageBox.information(self, "提示", "该目录正在保存中，请稍候再试", self.current_theme)
             return
         
         # 交换当前 entry 的 EC 行顺序
