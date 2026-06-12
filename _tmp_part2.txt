@@ -1,0 +1,600 @@
+        if not p:
+            self.lbl_img_dirty.setText("")
+            return
+        dirty = is_dirty(p)
+        self.lbl_img_dirty.setText("未保存修图" if dirty else "")
+
+    def _render_effective_preview(self, orig_id: int, orig_path: str):
+        """渲染当前 original 的“有效预览”：若存在 pending 则按参数渲染；否则退回默认预览逻辑。"""
+        if not orig_id or not orig_path:
+            return
+        p = self._pending_edits.get(orig_id)
+        if not p:
+            # 无 pending：走原有预览（优先显示当前 file_path）
+            self._on_image_selected()
+            return
+        dirty = is_dirty(p)
+        if not dirty:
+            self._on_image_selected()
+            return
+
+        # 有 pending：后台渲染（从原图 + 参数），避免阻塞 UI
+        self._preview_token += 1
+        token = self._preview_token
+        self._preview_expected_path = orig_path
+        self._set_dirty_badge(orig_id)
+
+        view_size = self.catalog_preview.viewport().size() if hasattr(self, "catalog_preview") else QSize(800, 800)
+        max_side = int(min(2200, max(900, max(view_size.width(), view_size.height()) * 2)))
+
+        # 快照，避免后台执行时 pending 被修改导致“预览跳动”
+        angle0 = float(p.get("angle") or 0.0)
+        crop0 = p.get("crop_box")
+        bf0 = p.get("border_fill")
+        pad0 = p.get("pad_a4")
+        spots0 = list(p.get("spots") or [])
+
+        def make_fn(fp=orig_path, ms=max_side, tok=token, angle=angle0, crop=crop0, bf=bf0, pad=pad0, spots=spots0):
+            try:
+                pending = {"angle": angle, "crop_box": crop, "border_fill": bf, "pad_a4": pad, "spots": spots}
+                qimg = render_preview_qimage(orig_path=fp, pending=pending, max_side=int(ms or 0))
+                return {"token": tok, "file_path": fp, "img": qimg}
+            except Exception as e:
+                return {"token": tok, "file_path": fp, "img": QImage(), "err": str(e)}
+
+        worker = Worker(make_fn)
+
+        def on_done(res):
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                if res.get("token") != self._preview_token:
+                    return
+                if (res.get("file_path") or "") != (self._preview_expected_path or ""):
+                    return
+                qimg = res.get("img")
+                if qimg is None or qimg.isNull():
+                    return
+                # 同一张图的修图预览刷新：保持用户当前缩放与视图中心
+                self.catalog_preview.set_image(QPixmap.fromImage(qimg), preserve_view=True)
+            except Exception:
+                pass
+
+        worker.signals.finished.connect(on_done)
+        self._thread_pool.start(worker)
+
+    def _on_pad_a4_toggle(self):
+        """一键开关：自动补边成 A4（背景色自动取外圈主色）。"""
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path or not os.path.exists(orig_path):
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        p = self._pending_for(int(orig_id))
+        # 几何变化会影响框选坐标，简单起见：切换 A4 时清空 spots
+        p["spots"] = []
+        if p.get("pad_a4"):
+            p["pad_a4"] = None
+        else:
+            # 背景色：优先用“边缘占比最多色”
+            color = dominant_border_color(orig_path, thickness=2)
+            p["pad_a4"] = {"color": tuple(color)}
+        self._set_dirty_badge(int(orig_id))
+        self._render_effective_preview(int(orig_id), orig_path)
+
+    def _on_preview_image_changed(self, has_image: bool):
+        """用于“框选污点去除”在预览尚未加载完成时的自动启用。"""
+        if not has_image:
+            return
+        # 若当前处于“污点去除模式”，确保预览控件持续可框选
+        if hasattr(self, "btn_img_fill") and self.btn_img_fill.isChecked():
+            try:
+                self.catalog_preview.enable_selection_mode(True, one_shot=False)
+            except Exception:
+                pass
+
+    def _on_spot_selected(self, payload: object):
+        """接收预览框选结果，记录为 pending spots 并刷新预览。"""
+        try:
+            rect = (payload or {}).get("rect_norm")
+        except Exception:
+            rect = None
+        if not rect:
+            return
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path:
+            return
+        p = self._pending_for(int(orig_id))
+        p.setdefault("spots", [])
+        p["spots"].append(tuple(rect))
+        self._set_dirty_badge(int(orig_id))
+        self._render_effective_preview(int(orig_id), orig_path)
+
+    def _on_spot_mode_toggled(self, checked: bool):
+        """进入/退出持续框选污点去除模式。"""
+        if not hasattr(self, "catalog_preview"):
+            return
+        if not checked:
+            try:
+                self.catalog_preview.enable_selection_mode(False)
+            except Exception:
+                pass
+            return
+        # 进入模式：若预览尚未加载，先触发预览；加载完成后 _on_preview_image_changed 会启用框选
+        if not getattr(self.catalog_preview, "_has_image", False):
+            self._on_image_selected()
+            return
+        try:
+            self.catalog_preview.enable_selection_mode(True, one_shot=False)
+        except Exception:
+            pass
+
+    def _on_trim_border(self):
+        """方案A：去黑边（新算法）= 外圈填充背景色；只记录 pending 并更新预览，不落盘。"""
+        img_id, _file_path, orig_id, orig_path = self._current_image_ctx()
+        if not img_id or not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        # 后台计算“外围占比最多”的颜色，避免大图取样阻塞 UI
+        self._preview_token += 1
+        token = self._preview_token
+        self._preview_expected_path = orig_path
+
+        def make_fn(fp=orig_path, tok=token):
+            return {"token": tok, "file_path": fp, "color": dominant_border_color(fp, thickness=1)}
+
+        worker = Worker(make_fn)
+
+        def on_done(res):
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                if res.get("token") != self._preview_token:
+                    return
+                if (res.get("file_path") or "") != (self._preview_expected_path or ""):
+                    return
+                color = tuple(res.get("color") or (255, 255, 255))
+                p = self._pending_for(orig_id)
+                p["border_fill"] = {"thickness": 1, "color": color}
+                self._set_dirty_badge(orig_id)
+                self._render_effective_preview(orig_id, orig_path)
+            except Exception:
+                pass
+
+        worker.signals.finished.connect(on_done)
+        self._thread_pool.start(worker)
+
+    def _on_trim_border_mm(self, mm: int):
+        """按毫米数擦除图片边缘（基于 300 DPI 换算像素），只记录 pending 并更新预览。"""
+        img_id, _file_path, orig_id, orig_path = self._current_image_ctx()
+        if not img_id or not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        # 毫米转像素（300 DPI）
+        thickness_px = mm_to_pixels(mm, dpi=300)
+        # 后台计算外围主色
+        self._preview_token += 1
+        token = self._preview_token
+        self._preview_expected_path = orig_path
+
+        def make_fn(fp=orig_path, tok=token, t=thickness_px):
+            return {"token": tok, "file_path": fp, "color": dominant_border_color(fp, thickness=t), "thickness": t}
+
+        worker = Worker(make_fn)
+
+        def on_done(res):
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                if res.get("token") != self._preview_token:
+                    return
+                if (res.get("file_path") or "") != (self._preview_expected_path or ""):
+                    return
+                color = tuple(res.get("color") or (255, 255, 255))
+                t = res.get("thickness") or thickness_px
+                p = self._pending_for(orig_id)
+                p["border_fill"] = {"thickness": t, "color": color}
+                self._set_dirty_badge(orig_id)
+                self._render_effective_preview(orig_id, orig_path)
+            except Exception:
+                pass
+
+        worker.signals.finished.connect(on_done)
+        self._thread_pool.start(worker)
+
+    def _get_enhance_pending(self, orig_id) -> dict:
+        """获取或创建当前图片的 enhance 子字典。"""
+        p = self._pending_for(orig_id)
+        enh = p.get("enhance")
+        if enh is None:
+            enh = {"gray_remove": 0.0, "brightness": 1.0, "contrast": 1.0, "sharpen": 0.0}
+            p["enhance"] = enh
+        return enh
+
+    def _on_gray_remove(self):
+        """去灰底：将灰色背景提亮为白色，保留文字和内容。"""
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        enh = self._get_enhance_pending(orig_id)
+        # 切换：已开启则关闭，否则设置强度 1.0
+        cur = float(enh.get("gray_remove") or 0.0)
+        enh["gray_remove"] = 0.0 if cur > 0.01 else 1.0
+        self._set_dirty_badge(orig_id)
+        self._render_effective_preview(orig_id, orig_path)
+
+    def _on_adjust_brightness(self, delta: float):
+        """增/减亮度，每次步进 delta（如 +0.1 / -0.1）。"""
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        enh = self._get_enhance_pending(orig_id)
+        cur = float(enh.get("brightness") or 1.0)
+        enh["brightness"] = max(0.2, min(3.0, cur + float(delta)))
+        self._set_dirty_badge(orig_id)
+        self._render_effective_preview(orig_id, orig_path)
+
+    def _on_adjust_contrast(self, delta: float):
+        """增/减对比度，每次步进 delta（如 +0.1 / -0.1）。"""
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        enh = self._get_enhance_pending(orig_id)
+        cur = float(enh.get("contrast") or 1.0)
+        enh["contrast"] = max(0.2, min(3.0, cur + float(delta)))
+        self._set_dirty_badge(orig_id)
+        self._render_effective_preview(orig_id, orig_path)
+
+    def _on_sharpen(self):
+        """锐化切换：未开启则设为 1.0，已开启则关闭。"""
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        enh = self._get_enhance_pending(orig_id)
+        cur = float(enh.get("sharpen") or 0.0)
+        enh["sharpen"] = 0.0 if cur > 0.01 else 1.0
+        self._set_dirty_badge(orig_id)
+        self._render_effective_preview(orig_id, orig_path)
+
+    def _on_auto_enhance(self):
+        """一键美化：去灰底 + 轻微增亮 + 轻微增对比 + 轻微锐化。"""
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        p = self._pending_for(orig_id)
+        p["enhance"] = {
+            "gray_remove": 1.0,
+            "brightness": 1.1,
+            "contrast": 1.15,
+            "sharpen": 0.8,
+        }
+        self._set_dirty_badge(orig_id)
+        self._render_effective_preview(orig_id, orig_path)
+
+    def _on_rotate_fine(self, direction: int):
+        """方案A：角度微调只累计 angle 并更新预览，不落盘。"""
+        img_id, _file_path, orig_id, orig_path = self._current_image_ctx()
+        if not img_id or not orig_id or not orig_path:
+            StyledMessageBox.information(self, "提示", "请先选择一张图片", self.current_theme)
+            return
+        # 从输入框获取角度
+        angle_text = self.rotate_angle_input.text().strip().replace("°", "")
+        try:
+            step_deg = float(angle_text) if angle_text else 0.0
+        except ValueError:
+            step_deg = 0.0
+        # direction > 0 为正方向（顺时针），direction < 0 为负方向（逆时针）
+        delta = step_deg if direction > 0 else -step_deg
+        p = self._pending_for(orig_id)
+        p["angle"] = float(p.get("angle") or 0.0) + float(delta)
+        self._set_dirty_badge(orig_id)
+        self._render_effective_preview(orig_id, orig_path)
+
+    def _reset_current_pending(self):
+        _img_id, _fp, orig_id, orig_path = self._current_image_ctx()
+        if not orig_id:
+            return
+        self._pending_edits.pop(orig_id, None)
+        self._set_dirty_badge(orig_id)
+        # 重新显示当前选择（优先修图版/原图）
+        self._on_image_selected()
+
+    def _on_move_node_up(self):
+        """将当前选中的目录节点上移一位。"""
+        self._move_node_in_tree(-1)
+
+    def _on_move_node_down(self):
+        """将当前选中的目录节点下移一位。"""
+        self._move_node_in_tree(1)
+
+    def _move_node_in_tree(self, direction: int):
+        """
+        移动当前选中的目录节点：
+        - direction < 0: 上移（与前一个同级节点交换）
+        - direction > 0: 下移（与后一个同级节点交换）
+        """
+        # 设置标志，跳过 on_catalog_current_changed 的校验
+        self._moving_node = True
+        try:
+            current_item = self.catalog_tree.currentItem()
+            if not current_item:
+                StyledMessageBox.information(self, "提示", "请先选择一个目录节点", self.current_theme)
+                return
+
+            # 获取父节点
+            parent_item = current_item.parent()
+            if parent_item:
+                # 有父节点，在父节点的子节点中查找位置
+                current_index = parent_item.indexOfChild(current_item)
+                sibling_count = parent_item.childCount()
+            else:
+                # 没有父节点，在根节点中查找
+                root = self.catalog_tree.invisibleRootItem()
+                current_index = root.indexOfChild(current_item)
+                sibling_count = root.childCount()
+                parent_item = root
+
+            if sibling_count < 2:
+                return
+
+            # 计算目标位置
+            target_index = current_index + direction
+            if target_index < 0 or target_index >= sibling_count:
+                # 已经在边界，无法移动
+                return
+
+            # 获取目标节点
+            target_item = parent_item.child(target_index)
+            if not target_item:
+                return
+
+            # 获取两个节点的模板项 ID（存储在 Qt.UserRole 中）
+            current_tpl_id = current_item.data(0, Qt.UserRole)
+            target_tpl_id = target_item.data(0, Qt.UserRole)
+            if not current_tpl_id or not target_tpl_id:
+                return
+
+            # 调用 repo 层交换 sort_order
+            try:
+                success = swap_catalog_template_item_sort_order(
+                    item_id_a=int(current_tpl_id),
+                    item_id_b=int(target_tpl_id)
+                )
+                if not success:
+                    return
+            except Exception as e:
+                print(f"[catalog-entry] swap sort order failed: {e}")
+                return
+
+            # 记住当前选中的节点 ID，刷新后恢复选中
+            selected_tpl_id = current_tpl_id
+
+            # 刷新目录树
+            self._populate_catalog_tree()
+
+            # 恢复选中状态
+            try:
+                self._select_tree_item_by_tpl_id(selected_tpl_id)
+            except Exception as e:
+                print(f"[catalog-entry] restore selection failed: {e}")
+            
+            # 移动后更新同级节点的序号（需要重新获取 parent_item）
+            # 注意：如果移动的是模板固定节点，不需要更新序号
+            try:
+                current_item_after_refresh = self.catalog_tree.currentItem()
+                if current_item_after_refresh:
+                    # 检查当前节点是否是模板固定的
+                    tpl_serial = current_item_after_refresh.data(0, Qt.UserRole + 10) or ""
+                    tpl_name = current_item_after_refresh.data(1, Qt.UserRole + 10) or ""
+                    # 如果是模板固定节点（有预设的编号或名称），不更新序号
+                    if not (tpl_serial.strip() or tpl_name.strip()):
+                        parent_item_after_refresh = current_item_after_refresh.parent()
+                        if parent_item_after_refresh is None:
+                            parent_item_after_refresh = self.catalog_tree.invisibleRootItem()
+                        self._update_sibling_serials(parent_item_after_refresh)
+            except Exception as e:
+                print(f"[catalog-entry] update serials after move failed: {e}")
+        except Exception as e:
+            print(f"[catalog-entry] move node failed: {e}")
+            # 不要闪退，只是静默失败
+        finally:
+            # 确保标志被清除
+            self._moving_node = False
+
+    def _select_tree_item_by_tpl_id(self, tpl_id: int):
+        """根据模板项 ID 选中目录树中的节点。"""
+        if not tpl_id:
+            return
+
+        try:
+            def find_and_select(parent_item):
+                if not parent_item:
+                    return False
+                for i in range(parent_item.childCount()):
+                    try:
+                        child = parent_item.child(i)
+                        if not child:
+                            continue
+                        if child.data(0, Qt.UserRole) == tpl_id:
+                            self.catalog_tree.setCurrentItem(child)
+                            return True
+                        if find_and_select(child):
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            find_and_select(self.catalog_tree.invisibleRootItem())
+        except Exception as e:
+            print(f"[catalog-entry] select tree item failed: {e}")
+
+    def _update_sibling_serials(self, parent_item):
+        """
+        更新同级节点的序号：按照当前顺序重新编号为 1, 2, 3...
+        如果序号是模板固定的，则不更新。
+        """
+        if not parent_item:
+            return
+        
+        try:
+            # 确保 entry 已存在
+            self._ensure_entry_record()
+            if not self.current_entry_id:
+                return
+
+            child_count = parent_item.childCount()
+            for i in range(child_count):
+                try:
+                    child = parent_item.child(i)
+                    if not child:
+                        continue
+                    
+                    # 检查序号是否是模板固定的
+                    tpl_serial = child.data(0, Qt.UserRole + 10) or ""
+                    if tpl_serial.strip():
+                        # 模板固定的序号，不更新
+                        continue
+                    
+                    # 计算新序号：索引 + 1
+                    new_serial = str(i + 1)
+                    
+                    # 更新 UI
+                    self._suppress_catalog_changed = True
+                    child.setText(0, new_serial)
+                    self._suppress_catalog_changed = False
+                    
+                    # 序号改由 pending 队列异步批量落盘（经由 _stage_pending 同时镜像到 WAL）
+                    tpl_item_id = child.data(0, Qt.UserRole)
+                    ec_item_id = child.data(1, Qt.UserRole)
+                    if tpl_item_id:
+                        self._stage_pending(tpl_item_id, child, ec_item_id, {"serial": new_serial})
+                except Exception as e:
+                    print(f"[catalog-entry] process child {i} failed: {e}")
+                    continue
+        except Exception as e:
+            print(f"[catalog-entry] update sibling serials failed: {e}")
+
+    def _commit_current_pending(self):
+        img_id, fp, orig_id, _orig_path = self._current_image_ctx()
+        if not orig_id:
+            return
+        # 保存修图后刷新列表时恢复当前选中
+        self._select_after_reload = {"file_path": fp or "", "img_id": img_id}
+        self._commit_all_pending(blocking=True, only_orig_id=orig_id)
+
+    def _commit_all_pending(self, blocking: bool = True, only_orig_id=None):
+        """
+        将 pending 修图一次性落盘 + 写库：
+        - 输出固定为 *_retouched*（覆盖）
+        - upsert retouched（唯一性由 repo 层保证）
+        """
+        if not self._pending_edits:
+            return
+        # 收集要提交的列表，避免遍历过程中修改 dict
+        targets = []
+        for oid, p in list(self._pending_edits.items()):
+            if only_orig_id is not None and oid != only_orig_id:
+                continue
+            dirty = is_dirty(p)
+            if dirty:
+                targets.append((oid, p))
+        if not targets:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            updates = []
+            for orig_id, p in targets:
+                info = None
+                try:
+                    # 连续修图：输入基线优先使用 retouched；输出命名仍以 original 为准
+                    info = resolve_edit_base_image_info(image_id=int(orig_id), fallback_path="")
+                except Exception:
+                    info = None
+                if not info:
+                    continue
+                base_src_path = (info.get("base_file_path") or "").strip()
+                orig_path_for_name = (info.get("orig_file_path") or "").strip()
+                if (not base_src_path) or (not os.path.exists(base_src_path)):
+                    continue
+
+                if not orig_path_for_name:
+                    orig_path_for_name = base_src_path
+                out_path, out_name = self._retouched_output_path(orig_path_for_name)
+
+                # 从“基线图”（优先修图版）应用本次 pending 生成最终图并保存（覆盖同一文件）
+                process_and_save(orig_path=base_src_path, pending=p, out_path=out_path, out_name=out_name)
+
+                mime, _ = mimetypes.guess_type(out_path)
+                size = os.path.getsize(out_path) if os.path.exists(out_path) else None
+                updates.append(
+                    {
+                        "orig_id": int(info.get("orig_id") or orig_id),
+                        "entry_catalog_item_id": info.get("orig_entry_catalog_item_id"),
+                        "orig_sort_order": info.get("orig_sort_order"),
+                        "out_path": out_path,
+                        "out_name": out_name,
+                        "mime_type": mime or "",
+                        "file_size": size,
+                    }
+                )
+                # 清理该 original 的 pending
+                self._pending_edits.pop(orig_id, None)
+            # 批量写库：一次提交更接近原行为
+            try:
+                upsert_retouched_batch(updates)
+            except Exception:
+                # 与原实现一致：写库失败不阻断 UI（交给上层调用者感知）
+                pass
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # 刷新并更新标记/预览
+        self._set_dirty_badge(None)
+        self._load_images_for_item(self._current_catalog_item())
+
+    def _populate_catalog_tree(self):
+        """从数据库加载当前选中模板的目录树。"""
+        self.catalog_tree.clear()
+        tpl_id = self._current_template_id()
+        if not tpl_id:
+            print("[catalog-entry] no template selected")
+            return
+        self.current_template_id = tpl_id
+        # 确保当前 entry 存在
+        self._ensure_entry_record()
+        if not getattr(self, "_purged_empty_catalog_items_once", False):
+            self._purged_empty_catalog_items_once = True
+            try:
+                if self.current_entry_id:
+                    # 1) 先合并同槽位重复 EC 行（关键：避免空行遮蔽数据行）
+                    #    历史并发 upsert / WAL 回放可能产生重复，加载前必须先合并，
+                    #    否则用户看到的可能是一条空白替身，而真正有数据的行被隐藏。
+                    merged = merge_duplicate_entry_catalog_items(
+                        entry_id=int(self.current_entry_id)
+                    )
+                    if merged:
+                        print(f"[catalog-entry] merged duplicate catalog items: {merged}")
+                    # 2) 再清掉真正的空行（只删 1 小时以前都没字段的行，保守策略）
+                    purged = delete_empty_entry_catalog_items(entry_id=int(self.current_entry_id))
+                    if purged:
+                        print(f"[catalog-entry] purged empty catalog items: {purged}")
+            except Exception as e:
+                print(f"[catalog-entry] purge empty catalog items failed: {e}")
+
+        try:
+            rows = list_catalog_template_items(tpl_id)
+        except Exception as e:
+            print(f"[catalog-entry] load template items failed: {e}")
+            return
+
+        by_parent = {}
+        for r in rows:
+            parent_key = r.get("parent_id") or None  # 兼容 parent_id 为 0 的数据
+            by_parent.setdefault(parent_key, []).append(r)
+
+        # 批量加载所有 EC 项（1 次 DB 查询替代 N 次）

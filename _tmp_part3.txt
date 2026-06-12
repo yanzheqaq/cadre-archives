@@ -1,0 +1,600 @@
+        _empty_ec = {"id": None, "serial": "", "name": "", "year": None,
+                     "month": None, "day": None, "pages": None, "remark": ""}
+        ec_cache = {}
+        if self.current_entry_id:
+            try:
+                ec_cache = batch_get_entry_catalog_items(entry_id=int(self.current_entry_id))
+            except Exception as e:
+                print(f"[catalog-entry] batch load ec items failed: {e}")
+
+        def add_nodes(parent_id, parent_item):
+            children = by_parent.get(parent_id, [])
+            child_infos = []
+            has_real_leaf_data = False
+
+            for r in children:
+                # 模板预设的编号和名称（用于判断是否锁定）
+                tpl_serial = r.get("serial") or ""
+                tpl_name = r.get("name") or ""
+                is_structural = bool(tpl_serial.strip() or tpl_name.strip())
+
+                # 从缓存中获取 EC 数据（替代单次 DB 查询）
+                ec_item = ec_cache.get(r["id"]) or dict(_empty_ec)
+                has_data = ec_item.get("id") is not None
+                child_infos.append((r, tpl_serial, tpl_name, is_structural, ec_item, has_data))
+                if not is_structural and has_data:
+                    has_real_leaf_data = True
+
+            blank_shown = False  # 每个父节点下只保留一个空白行
+
+            for r, tpl_serial, tpl_name, is_structural, ec_item, has_data in child_infos:
+                if not is_structural and not has_data:
+                    # 只有在当前父节点没有任何实际录入内容时，才保留一个空行
+                    if has_real_leaf_data:
+                        continue
+                    if blank_shown:
+                        continue
+                    blank_shown = True
+                    # 显示为完全空白行（无序号、无数据）
+                    item = self._create_item(
+                        data={"serial": "", "name": "", "year": None,
+                              "month": None, "day": None, "pages": None, "desc": ""},
+                        tpl_serial=tpl_serial,
+                        tpl_name=tpl_name,
+                    )
+                else:
+                    item = self._create_item(
+                        data={
+                            # 优先显示已录入数据的编号/名称，若无则回退模板定义
+                            "serial": ec_item.get("serial") or tpl_serial,
+                            "name": ec_item.get("name") or tpl_name,
+                            "year": ec_item["year"],
+                            "month": ec_item["month"],
+                            "day": ec_item["day"],
+                            "pages": ec_item["pages"],
+                            "desc": ec_item["remark"],
+                        },
+                        tpl_serial=tpl_serial,
+                        tpl_name=tpl_name,
+                    )
+
+                # 存储模板项ID和 entry_catalog_item ID
+                item.setData(0, Qt.UserRole, r["id"])
+                item.setData(1, Qt.UserRole, ec_item["id"])
+                # 乐观锁基线：加载时观察到的 updated_at，staging 时会传回 DB 检测冲突
+                item.setData(1, Qt.UserRole + 20, ec_item.get("updated_at"))
+                # 将节点挂载到父节点/根节点
+                parent_item.addChild(item)
+                if r.get("id"):
+                    add_nodes(r["id"], item)
+
+        self._suppress_catalog_changed = True
+        add_nodes(None, self.catalog_tree.invisibleRootItem())
+        # 加载后自动为没有序号的子节点分配序号
+        self._auto_assign_serials(self.catalog_tree.invisibleRootItem())
+        # 修正序号：确保同级数据行从 1 连续编号（消除因空槽位偏移导致的错误序号）
+        self._fix_serials_recursive(self.catalog_tree.invisibleRootItem())
+        self._suppress_catalog_changed = False
+        self.catalog_tree.expandAll()
+        # 更新总页数统计
+        self._update_total_pages_label()
+        # 后台预热自动补全词库：用户第一次键入就命中缓存，不会卡 UI
+        try:
+            tpl_name = self._get_current_template_name()
+            if tpl_name:
+                get_autocomplete_manager().warmup_template_async(tpl_name)
+        except Exception as e:
+            print(f"[catalog-entry] autocomplete warmup schedule failed: {e}")
+
+    def _update_total_pages_label(self, *, refresh_image_count: bool = True):
+        """更新左下角的总页数 / 图片数 / 总条数统计（防抖 + 异步）。
+
+        性能说明（2026-05 修复）
+        -----------------------
+        旧实现对图片数做了同步 DB 查询 ``count_entry_total_images()``，并在每次
+        Tab 切列（col 1 或 5）都被调用一次——远程 MySQL 往返 10~100ms，
+        密集录入时光标一直转圈。修复思路：
+
+        1. **合并重复调用**：通过 ``_stats_refresh_timer``（180ms 单次定时器）
+           把连续键入的多次请求合并成一次真正刷 UI。
+        2. **图片数异步化**：只有在显式要求（图片被增删/目录刚加载）时才调
+           ``count_entry_total_images()``，并且放到后台 Worker 线程去跑，
+           结果回来再缓存、刷 label。主线程零 DB IO。
+        3. **光标移动/键入路径不触发 DB**：``_on_catalog_item_changed`` 走
+           ``refresh_image_count=False`` 分支，只刷新前端汇总字段。
+
+        参数
+        ----
+        refresh_image_count
+            True（默认）—— 下一次 timer tick 会发起异步图片数查询。
+            False —— 仅刷新基于树内容的统计（页数/总条数），不查 DB。
+        """
+        if not hasattr(self, 'total_pages_label'):
+            return
+        if refresh_image_count:
+            self._stats_refresh_need_image_count = True
+        try:
+            self._stats_refresh_timer.start()
+        except RuntimeError:
+            # 对话框已被 deleteLater，忽略
+            pass
+
+    def _do_refresh_stats_ui(self):
+        """真正执行统计刷新的地方（防抖 timer 触发）。主线程纯内存扫描，无 DB IO。"""
+        if getattr(self, "_is_closing", False):
+            return
+        if not hasattr(self, 'total_pages_label'):
+            return
+        # 再次保护：C++ tree 可能已被 destroy
+        try:
+            root = self.catalog_tree.invisibleRootItem()
+        except RuntimeError:
+            return
+
+        total_pages = 0
+        entry_count = 0
+
+        def _walk(node):
+            nonlocal total_pages, entry_count
+            pages_str = node.text(5).strip()
+            if pages_str:
+                try:
+                    total_pages += int(pages_str)
+                except ValueError:
+                    pass
+            tpl_serial = node.data(0, Qt.UserRole + 10) or ""
+            tpl_name = node.data(1, Qt.UserRole + 10) or ""
+            is_tpl = bool(tpl_serial.strip() or tpl_name.strip())
+            name = node.text(1).strip()
+            if not is_tpl and name:
+                entry_count += 1
+            for i in range(node.childCount()):
+                _walk(node.child(i))
+
+        try:
+            for i in range(root.childCount()):
+                _walk(root.child(i))
+        except RuntimeError:
+            return
+
+        try:
+            self.total_pages_label.setText(f"总页数：{total_pages}")
+        except RuntimeError:
+            return
+        if hasattr(self, 'total_entries_label'):
+            try:
+                self.total_entries_label.setText(f"总条数：{entry_count}")
+            except RuntimeError:
+                pass
+
+        # 图片数：优先展示缓存值；需要时再启异步查询刷新
+        if hasattr(self, 'total_images_label'):
+            cached = self._total_images_cache
+            if cached is not None:
+                try:
+                    self.total_images_label.setText(f"图片数：{cached}")
+                except RuntimeError:
+                    return
+            if self._stats_refresh_need_image_count:
+                self._stats_refresh_need_image_count = False
+                self._schedule_image_count_refresh()
+
+    def _schedule_image_count_refresh(self):
+        """把 count_entry_total_images 放到后台 Worker 线程，避免阻塞 UI。"""
+        if getattr(self, "_is_closing", False):
+            return
+        if self._image_count_in_flight:
+            return  # 已在飞行，忽略
+        if not self.current_entry_id:
+            # 没有 entry 时直接显示 0
+            self._total_images_cache = 0
+            if hasattr(self, 'total_images_label'):
+                try:
+                    self.total_images_label.setText("图片数：0")
+                except RuntimeError:
+                    pass
+            return
+        entry_id = int(self.current_entry_id)
+        self._image_count_in_flight = True
+
+        def _do_count():
+            try:
+                return int(count_entry_total_images(entry_id=entry_id))
+            except Exception as e:
+                print(f"[catalog-entry] count_entry_total_images failed: {e}")
+                return None
+
+        def _on_loaded(value):
+            # 已关闭就丢弃结果，绝不触 C++ 对象
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                self._image_count_in_flight = False
+                if value is None:
+                    return
+                self._total_images_cache = int(value)
+                if hasattr(self, 'total_images_label'):
+                    self.total_images_label.setText(f"图片数：{value}")
+            except RuntimeError:
+                # C++ label 已销毁
+                return
+
+        def _on_error(err):
+            # 标志复位；保留旧缓存，下次刷新再重试
+            if getattr(self, "_is_closing", False):
+                return
+            self._image_count_in_flight = False
+            print(f"[catalog-entry] image-count worker error: {err}")
+
+        worker = Worker(_do_count)
+        worker.signals.finished.connect(_on_loaded)
+        worker.signals.error.connect(_on_error)
+        self._thread_pool.start(worker)
+
+    def _apply_catalog_font_zoom(self, point_size: float):
+        f = QFont(self._base_font)
+        f.setPointSizeF(point_size)
+        self.catalog_tree.setFont(f)
+        if hasattr(self, "catalog_preview"):
+            self.catalog_preview.setFont(f)
+
+    def _apply_toolbar_style(self):
+        """同步模板选择区与操作按钮的样式，适配主题。"""
+        if not hasattr(self, "action_frame"):
+            return
+        if self.current_theme == "dark":
+            bg = "#1f2937"
+            border = "#2f3a4c"
+            text = "#e5e7eb"
+            combo_bg = "#2b3544"
+            btn_bg = "#2b3544"
+            btn_bg_hover = "#334155"
+        else:
+            bg = "#f7f9fb"
+            border = "#d0d7de"
+            text = "#1f2937"
+            combo_bg = "#ffffff"
+            btn_bg = "#ffffff"
+            btn_bg_hover = "#e8f0fe"
+
+        self.action_frame.setStyleSheet(
+            f"""
+            QFrame#catalog_action_frame {{
+                background: {bg};
+                border: 1px solid {border};
+                border-radius: 8px;
+            }}
+            QLabel#tpl_label {{
+                color: {text};
+                font-size: 14px;
+            }}
+            QComboBox#tpl_combo {{
+                background: {combo_bg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: {text};
+                min-height: 28px;
+            }}
+            QComboBox#tpl_combo::drop-down {{
+                width: 22px;
+                border: none;
+            }}
+            QPushButton#catalog_action_btn {{
+                background: {btn_bg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 4px 10px;
+                color: {text};
+                font-weight: 600;
+                min-height: 26px;
+            }}
+            QPushButton#catalog_action_btn:hover {{
+                background: {btn_bg_hover};
+            }}
+            QPushButton#catalog_action_btn:pressed {{
+                background: {btn_bg};
+            }}
+            QPushButton#pager_btn {{
+                background: {btn_bg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 2px 8px;
+                color: {text};
+                font-weight: 500;
+                min-height: 20px;
+                max-height: 24px;
+            }}
+            QPushButton#pager_btn:hover {{
+                background: {btn_bg_hover};
+            }}
+            QPushButton#pager_btn:pressed {{
+                background: {btn_bg};
+            }}
+            QLineEdit#pager_input {{
+                background: {btn_bg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 2px 6px;
+                color: {text};
+                min-height: 22px;
+                max-height: 22px;
+            }}
+            QLabel#pager_total {{
+                color: {text};
+            }}
+            QToolButton#pager_icon_btn {{
+                background: {btn_bg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 2px;
+                min-height: 22px;
+                min-width: 22px;
+            }}
+            QToolButton#pager_icon_btn:hover {{
+                background: {btn_bg_hover};
+            }}
+            QToolButton#pager_icon_btn:pressed {{
+                background: {btn_bg};
+            }}
+            """
+        )
+
+    # === 图片挂接（单节点） ===
+    def _image_root(self):
+        try:
+            root = AppSettings().get_image_root()
+            if root:
+                return root
+        except Exception:
+            pass
+        return os.getenv("IMAGE_ROOT", os.path.join(os.getcwd(), "data", "images"))
+
+    # 图片相关的纯工具函数已抽到：inventory_ui/utils/image_loading.py
+
+    def on_catalog_current_changed(self, item, prev=None):
+        """行切换时触发：检查离开的行的日期完整性和升序。"""
+        if self._catalog_name_editor_item is not None and self._catalog_name_editor_item is not item:
+            self._hide_catalog_name_editor()
+        # 行切换时立即落盘 pending 保存，避免数据丢失
+        self._flush_catalog_pending_saves()
+        # 如果正在移动节点，跳过所有校验
+        if getattr(self, '_moving_node', False):
+            return
+        
+        # 如果正在程序化恢复选中，跳过校验
+        if getattr(self, '_restoring_selection', False):
+            self._load_images_for_item(item)
+            return
+
+        # 如果是同一行内切换列（Tab切换），跳过校验
+        if item is prev or item == prev:
+            return
+
+        # 检查离开的行（prev）是否需要校验
+        if prev is not None:
+            # 检查是否是模板原有条目（有预设名称的），模板原有条目不检查年月日
+            tpl_name = prev.data(1, Qt.UserRole + 10) or ""
+            if tpl_name.strip():
+                # 模板原有条目，跳过年月日检查
+                self._load_images_for_item(item)
+                return
+            
+            # 检查是否输入了目录名称
+            name_str = prev.text(1).strip()
+            
+            # 只要输入了目录名称，就必须填写年月日
+            if name_str:
+                year_str = prev.text(2).strip()
+                month_str = prev.text(3).strip()
+                day_str = prev.text(4).strip()
+                has_any = bool(year_str or month_str or day_str)
+                is_complete = bool(year_str and month_str and day_str)
+
+                # 如枟有输入但不完整，或者完全没输入，提示并恢复选中
+                if not is_complete:
+                    if self._date_warning_suppressed:
+                        pass  # 已提示过，允许跳过
+                    # else:
+                    #     missing = []
+                    #     if not year_str: missing.append("年")
+                    #     if not month_str: missing.append("月")
+                    #     if not day_str: missing.append("日")
+                    #     StyledMessageBox.warning(self, "提示", f"输入目录名称后必须填写年月日\n\n缺少：{'、'.join(missing)}", self.current_theme)
+                    #     self._date_warning_suppressed = True
+                    #     self._restoring_selection = True
+                    #     self.catalog_tree.setCurrentItem(prev)
+                    #     self._restoring_selection = False
+                    #     if not year_str:
+                    #         self._reenter_edit(prev, 2)
+                    #     elif not month_str:
+                    #         self._reenter_edit(prev, 3)
+                    #     else:
+                    #         self._reenter_edit(prev, 4)
+                    #     return
+
+                # 如果日期完整，检查升序（这是提示，可以忽略）
+                if is_complete:
+                    passed, edit_col = self._check_date_ascending(prev)
+                    if not passed:
+                        # 用户选择修改，恢复选中并定位到对应字段
+                        self._restoring_selection = True
+                        self.catalog_tree.setCurrentItem(prev)
+                        self._restoring_selection = False
+                        self._reenter_edit(prev, edit_col or 2)
+                        return
+
+        self._load_images_for_item(item)
+
+    def _on_request_edit_column(self, item, column):
+        """Tab 键切换列时由 delegate 触发，进入指定列的编辑状态。"""
+        if self._validation_failed_reenter:
+            self._validation_failed_reenter = False
+            return
+        if item:
+            self.catalog_tree.setCurrentItem(item, column)
+            self._schedule_catalog_edit(item, column)
+
+    def _on_catalog_item_pressed(self, item, column):
+        if not item or getattr(self, "_is_closing", False):
+            return
+        self.catalog_tree.setCurrentItem(item, column)
+        self._schedule_catalog_edit(item, column)
+
+    def _on_catalog_item_clicked(self, item, column):
+        if not item or getattr(self, "_is_closing", False):
+            return
+        self._schedule_catalog_edit(item, column)
+
+    def _catalog_cell_rect(self, item, column):
+        row_rect = self.catalog_tree.visualItemRect(item)
+        header = self.catalog_tree.header()
+        x = header.sectionViewportPosition(column)
+        w = header.sectionSize(column)
+        return x, row_rect.y(), w, row_rect.height()
+
+    def _show_catalog_name_editor(self, item):
+        editor = self._catalog_name_editor
+        if editor is None or item is None:
+            return False
+        try:
+            if item.treeWidget() is not self.catalog_tree:
+                return False
+            tpl_value = item.data(1, Qt.UserRole + 10) or ""
+            if str(tpl_value).strip():
+                return False
+            x, y, w, h = self._catalog_cell_rect(item, 1)
+            self._catalog_name_editor_item = item
+            self._catalog_name_editor_updating = True
+            try:
+                if editor.text() != item.text(1):
+                    editor.setText(item.text(1))
+                editor.setCursorPosition(len(editor.text()))
+            finally:
+                self._catalog_name_editor_updating = False
+            editor.setGeometry(x + 1, y + 1, max(1, w - 2), max(1, h - 2))
+            editor.show()
+            editor.raise_()
+            editor.setFocus(Qt.OtherFocusReason)
+            return True
+        except RuntimeError:
+            return False
+
+    def _hide_catalog_name_editor(self):
+        editor = self._catalog_name_editor
+        if editor is None:
+            return
+        try:
+            if editor.isVisible():
+                self._sync_catalog_name_editor_to_item()
+                editor.hide()
+        except RuntimeError:
+            pass
+        self._catalog_name_editor_item = None
+
+    def _sync_catalog_name_editor_to_item(self):
+        editor = self._catalog_name_editor
+        item = self._catalog_name_editor_item
+        if editor is None or item is None:
+            return
+        try:
+            text = editor.text()
+            if item.text(1) == text and not (text and not item.text(0).strip()):
+                return
+            if item.text(1) != text:
+                self._suppress_catalog_changed = True
+                try:
+                    item.setText(1, text)
+                finally:
+                    self._suppress_catalog_changed = False
+
+            fields = {"name": text}
+            if text and not item.text(0).strip() and not (item.data(0, Qt.UserRole + 10) or "").strip():
+                parent_item = item.parent() or self.catalog_tree.invisibleRootItem()
+                auto_serial = str(parent_item.indexOfChild(item) + 1)
+                self._suppress_catalog_changed = True
+                try:
+                    item.setText(0, auto_serial)
+                finally:
+                    self._suppress_catalog_changed = False
+                fields["serial"] = auto_serial
+
+            if not self.current_entry_id and not text:
+                return
+            self._ensure_entry_record()
+            if not self.current_entry_id:
+                return
+            tpl_item_id = item.data(0, Qt.UserRole)
+            ec_item_id = item.data(1, Qt.UserRole)
+            if tpl_item_id:
+                self._stage_pending(tpl_item_id, item, ec_item_id, fields)
+            if text:
+                QTimer.singleShot(0, lambda v=text, i=item: self._record_autocomplete_entry(i, v))
+            self._update_total_pages_label(refresh_image_count=False)
+        except RuntimeError:
+            return
+
+    def _on_catalog_name_editor_text_changed(self, text):
+        if self._catalog_name_editor_updating:
+            return
+        self._sync_catalog_name_editor_to_item()
+        editor = self._catalog_name_editor
+        item = self._catalog_name_editor_item
+        if editor is None or item is None:
+            return
+        self._catalog_name_editor_seq += 1
+        seq = self._catalog_name_editor_seq
+
+        def emit_later():
+            if seq != self._catalog_name_editor_seq:
+                return
+            if self._catalog_name_editor is not editor or self._catalog_name_editor_item is not item:
+                return
+            try:
+                if not editor.isVisible() or editor.text() != text:
+                    return
+            except RuntimeError:
+                return
+            self._on_request_autocomplete(item, 1, editor, text)
+
+        QTimer.singleShot(80, emit_later)
+
+    def _commit_active_catalog_editor(self):
+        if self._catalog_name_editor is not None:
+            try:
+                if self._catalog_name_editor.isVisible():
+                    self._sync_catalog_name_editor_to_item()
+                    return True
+            except RuntimeError:
+                return False
+        delegate = getattr(self, "_catalog_delegate", None)
+        if delegate is None:
+            return False
+        editor = getattr(delegate, "_current_editor", None)
+        item = getattr(delegate, "_current_item", None)
+        column = getattr(delegate, "_current_col", -1)
+        if editor is None or item is None or column < 0:
+            return False
+        try:
+            if hasattr(editor, "text"):
+                text = editor.text()
+                if item.text(column) != text:
+                    item.setText(column, text)
+            delegate.commitData.emit(editor)
+            delegate.closeEditor.emit(editor, QStyledItemDelegate.NoHint)
+            return True
+        except RuntimeError:
+            return False
+
+    def _schedule_catalog_edit(self, item, column, delay_ms: int = 0):
+        if not item or getattr(self, "_is_closing", False):
+            return
+        try:
+            tree = getattr(self, "catalog_tree", None)
+            if tree is None or item.treeWidget() is not tree:
+                return
+            if int(column) == 1:
+                self._show_catalog_name_editor(item)
+                return
+            self._hide_catalog_name_editor()
+        except RuntimeError:

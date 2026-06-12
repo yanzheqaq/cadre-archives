@@ -1,0 +1,400 @@
+        pager_bar.addWidget(self.btn_img_brightness_dn)
+        pager_bar.addWidget(self.btn_img_contrast_up)
+        pager_bar.addWidget(self.btn_img_contrast_dn)
+        pager_bar.addWidget(self.btn_img_sharpen)
+        pager_bar.addWidget(self.btn_img_auto_enhance)
+        pager_bar.addSpacing(10)
+        pager_bar.addWidget(self.img_zoom_label)
+        pager_bar.addStretch()
+        right_layout.addWidget(pager_frame)
+
+        # 图片预览（支持 Ctrl+滚轮缩放 / 双击放大还原）
+        self.catalog_preview = ImagePreview()
+        self.catalog_preview.setMinimumSize(200, 200)
+        self.catalog_preview.zoomChanged = self._on_preview_zoom_changed
+        self.catalog_preview.selectionFinished.connect(self._on_spot_selected)
+        self.catalog_preview.imageChanged.connect(self._on_preview_image_changed)
+        right_layout.addWidget(self.catalog_preview)
+
+        self.btn_img_upload.clicked.connect(self._on_upload_images)
+        self.btn_img_batch_upload.clicked.connect(self._on_batch_upload_images)
+        self.btn_img_delete.clicked.connect(self._on_delete_image)
+        self.btn_img_set_cover.clicked.connect(self._on_set_cover)
+
+        # ── 上传队列信号连接 ──
+        _uq = get_upload_queue_manager()
+        _uq.task_started.connect(self._on_upload_task_started)
+        _uq.file_progress.connect(self._on_upload_file_progress)
+        _uq.task_finished.connect(self._on_upload_task_finished)
+        _uq.worker_error.connect(self._on_upload_worker_error)
+        _uq.queue_empty.connect(self._on_upload_queue_empty)
+        # 方案A：修图按钮只更新 pending 参数并刷新预览，不立即保存文件/写库
+        self.btn_img_trim.clicked.connect(self._on_trim_border)
+        self.btn_img_trim_1mm.clicked.connect(lambda: self._on_trim_border_mm(1))
+        self.btn_img_trim_2mm.clicked.connect(lambda: self._on_trim_border_mm(2))
+        self.btn_img_trim_3mm.clicked.connect(lambda: self._on_trim_border_mm(3))
+        # 调换左右转方向
+        self.btn_img_rotate_l.clicked.connect(lambda: self._on_rotate_fine(1))  # 左微调改为正方向
+        self.btn_img_rotate_r.clicked.connect(lambda: self._on_rotate_fine(-1))  # 右微调改为负方向
+        self.btn_img_rot90_l.clicked.connect(lambda: self._on_rotate_90(90))  # 左转90°改为正方向
+        self.btn_img_rot90_r.clicked.connect(lambda: self._on_rotate_90(-90))  # 右转90°改为负方向
+        self.btn_img_fill.toggled.connect(self._on_spot_mode_toggled)
+        self.btn_img_a4.clicked.connect(self._on_pad_a4_toggle)
+        self.btn_img_gray_remove.clicked.connect(self._on_gray_remove)
+        self.btn_img_brightness_up.clicked.connect(lambda: self._on_adjust_brightness(0.1))
+        self.btn_img_brightness_dn.clicked.connect(lambda: self._on_adjust_brightness(-0.1))
+        self.btn_img_contrast_up.clicked.connect(lambda: self._on_adjust_contrast(0.1))
+        self.btn_img_contrast_dn.clicked.connect(lambda: self._on_adjust_contrast(-0.1))
+        self.btn_img_sharpen.clicked.connect(self._on_sharpen)
+        self.btn_img_auto_enhance.clicked.connect(self._on_auto_enhance)
+        self.btn_img_prev.clicked.connect(lambda: self._shift_image(-1))
+        self.btn_img_next.clicked.connect(lambda: self._shift_image(1))
+        self.img_page_edit.returnPressed.connect(self._on_jump_page)
+        self.btn_img_commit.clicked.connect(self._commit_current_pending)
+        self.btn_img_reset.clicked.connect(self._reset_current_pending)
+        self.btn_print_preview.clicked.connect(self._on_print_preview)
+        self.btn_ai_retouch_config.clicked.connect(self._on_ai_retouch_config)
+
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([1000, 300])
+
+        catalog_layout.addWidget(splitter)
+
+        self._load_templates_to_combo()
+        # 若已有 entry 数据，则按其模板自动选中并加载；无数据则保持占位
+        self._autoselect_entry_template()
+
+        self.tab.addTab(catalog_widget, "目录录入")
+        # 清除模板/按钮区域样式，稍后单独给按钮设置样式
+        self.tpl_combo.setStyleSheet("")
+        for btn in (self.btn_cat_add_peer, self.btn_cat_add_child, self.btn_cat_del):
+            btn.setStyleSheet("")
+
+    # === 方案A：对话框保存时自动提交所有 pending 修图 ===
+    def accept(self):
+        # 先把 sync flush 跑完（确保 WAL/DB 落盘），再标记关闭状态——因为 sync
+        # flush 内部会 processEvents() 等待飞行中的 worker，worker 的 on_done
+        # 回调仍然需要访问 C++ 对象（例如 tree_item.setData / _catalog_save_timer）。
+        try:
+            # 关闭前先把当前正在编辑的 editor 文本提交到 item / pending / WAL，
+            # 否则用户在编辑中直接「保存」而没按 Enter/Tab 时会丢失最后一字段。
+            self._commit_active_catalog_editor()
+            self._flush_catalog_pending_saves_sync()  # 先同步落盘 pending 目录保存
+            # 保存前记住当前选中图片，提交后刷新列表时恢复
+            img_id, fp, _orig_id, _orig_path = self._current_image_ctx()
+            self._select_after_reload = {"file_path": fp or "", "img_id": img_id}
+            self._commit_all_pending(blocking=True)
+        except Exception:
+            pass
+        # 等待自动补全词频后台落盘（非主机端也保证本地 txt 一致性）
+        try:
+            get_autocomplete_manager().flush_sync(timeout=3.0)
+        except Exception:
+            pass
+        # sync flush 已完成，后续任何晚到的 worker 回调都不再允许触 C++ 对象
+        self._is_closing = True
+        self._stop_ui_timers_safely()
+        super().accept()
+
+    def closeEvent(self, event):
+        """关闭对话框前同步落盘所有 pending 目录保存，防止用户刚录入就关闭导致数据丢失。
+
+        顺序（防闪退 + 防丢数据）：
+        1. 先 sync flush 目录保存（内部会 processEvents 等 worker 完成，
+           此时需要 C++ 对象还活着）；
+        2. 再刷 autocomplete 词频落盘；
+        3. 最后置 ``_is_closing=True`` 并停掉 UI 定时器——晚到的 worker
+           回调看到标志就直接 return，避免触到已被 deleteLater() 的 C++
+           对象（RuntimeError: wrapped C/C++ object has been deleted）。
+        """
+        # 关闭前先把当前正在编辑的 editor 文本提交到 item / pending / WAL，
+        # 这一步必须早于 _flush_catalog_pending_saves_sync，否则编辑中的最后一字段
+        # 不在 pending 里，sync flush 也就写不出去。
+        try:
+            self._commit_active_catalog_editor()
+        except Exception:
+            pass
+        try:
+            self._flush_catalog_pending_saves_sync()
+        except Exception:
+            pass
+        try:
+            get_autocomplete_manager().flush_sync(timeout=3.0)
+        except Exception:
+            pass
+        self._is_closing = True
+        self._stop_ui_timers_safely()
+        super().closeEvent(event)
+
+    def _stop_ui_timers_safely(self):
+        """停掉所有 UI 定时器；每个都独立 try/except 以免一个挂掉影响其他。"""
+        for attr in ("_catalog_save_timer", "_stats_refresh_timer", "_info_save_timer"):
+            t = getattr(self, attr, None)
+            if t is None:
+                continue
+            try:
+                t.stop()
+            except RuntimeError:
+                pass
+
+    # === 信息总览：实时保存 Entry 基础信息 ===
+    def _init_live_person_save(self):
+        try:
+            self._info_save_timer = QTimer(self)
+            self._info_save_timer.setSingleShot(True)
+            self._info_save_timer.timeout.connect(self._flush_person_info_save)
+
+            for w in (
+                self.le_user,
+                self.le_empid,
+                self.le_role,
+                self.le_phone,
+                self.le_status,
+                self.le_id_card,
+                self.le_ethnicity,
+                self.le_native_place,
+                self.le_birth_date,
+            ):
+                try:
+                    # QComboBox 使用 currentTextChanged，QLineEdit 使用 textChanged
+                    if isinstance(w, QComboBox):
+                        w.currentTextChanged.connect(self._schedule_person_info_save)
+                    else:
+                        w.textChanged.connect(self._schedule_person_info_save)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _schedule_person_info_save(self):
+        # 防抖：用户持续输入时不频繁写库
+        try:
+            self._info_save_timer.start(350)
+        except Exception:
+            pass
+
+    def _flush_person_info_save(self):
+        entry_id = self.current_entry_id or self.case_data.get("entry_id")
+        if not entry_id:
+            # 无 entry_id 时无法写库（通常不应发生：人员从列表进入一定有 entry_id）
+            return
+        try:
+            # le_role / le_status 可能是 QComboBox，统一用 _text_of 取值
+            def _text_of(w):
+                return w.currentText() if isinstance(w, QComboBox) else w.text()
+
+            custom_fields = self._serialize_custom_fields()
+            update_entry_person_fields(
+                entry_id=int(entry_id),
+                name=self.le_user.text(),
+                emp_no=self.le_empid.text(),
+                role_title=_text_of(self.le_role),
+                phone=self.le_phone.text(),
+                status=_text_of(self.le_status),
+                id_card=self.le_id_card.text(),
+                custom_fields=custom_fields,
+            )
+            # 同步本地 case_data（用于标题/后续逻辑）
+            self.case_data["姓名"] = self.le_user.text()
+            self.case_data["工号"] = self.le_empid.text()
+            self.case_data["岗位"] = _text_of(self.le_role)
+            self.case_data["电话"] = self.le_phone.text()
+            self.case_data["状态"] = _text_of(self.le_status)
+            self.case_data["身份证号"] = self.le_id_card.text()
+            self.case_data["民族"] = self.le_ethnicity.text()
+            self.case_data["籍贯"] = self.le_native_place.text()
+            self.case_data["出生日期"] = self.le_birth_date.text()
+            self.case_data["custom_fields"] = custom_fields
+            self.case_data["自定义字段"] = custom_fields
+
+            # 更新标题栏文本
+            title_name = self.case_data.get("姓名") or self.case_data.get("工号") or ""
+            self._title_text = f"录入 - {title_name}"
+            self.setWindowTitle(self._title_text)
+            try:
+                # 对应 initUI 中的 title_label
+                if hasattr(self, "header") and self.header:
+                    pass
+            except Exception:
+                pass
+            # 直接查找标题 label 更新（避免持有引用失效）
+            try:
+                for lab in self.findChildren(QLabel, "dialog_title_label"):
+                    lab.setText(self._title_text)
+            except Exception:
+                pass
+        except Exception:
+            # 实时保存失败不弹窗打断输入
+            pass
+
+    # === 自定义扩展字段 ===
+    FIXED_CUSTOM_FIELD_NAMES = ("民族", "籍贯", "出生日期")
+    CUSTOM_FIELD_OPTIONS = [
+        "入党日期", "参加工作时间",
+        "学历", "学位", "毕业院校", "专业", "婚姻状况",
+        "政治面貌", "现任职务", "任职时间", "原单位",
+        "档案编号", "备注", "性别", "血型", "户籍地址", "现住址",
+    ]
+
+    def _custom_fields_from_data(self):
+        import json
+        raw = self.case_data.get("自定义字段") or self.case_data.get("custom_fields") or ""
+        if not raw:
+            return []
+        try:
+            fields = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            return []
+        return fields if isinstance(fields, list) else []
+
+    def _get_fixed_custom_field_value(self, field_name: str) -> str:
+        direct = self.case_data.get(field_name)
+        if direct:
+            return str(direct)
+        for item in self._custom_fields_from_data():
+            if not isinstance(item, dict):
+                continue
+            if (item.get("field_name") or "").strip() == field_name:
+                return str(item.get("field_value") or "")
+        return ""
+
+    def _load_custom_fields_from_data(self):
+        """从 case_data 加载已有的自定义字段并创建 UI 行。"""
+        for item in self._custom_fields_from_data():
+            if not isinstance(item, dict):
+                continue
+            fn = item.get("field_name") or ""
+            fv = item.get("field_value") or ""
+            if fn and fn not in self.FIXED_CUSTOM_FIELD_NAMES:
+                self._add_custom_field_row(field_name=fn, field_value=fv)
+
+    def _add_custom_field_row(self, field_name: str = "", field_value: str = ""):
+        """添加一行自定义字段（下拉选字段名 + 输入框 + 删除按钮）。"""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+
+        label_style = "font-size: 13px; color: #666; font-weight: 500;"
+        input_style = (
+            "QLineEdit, QComboBox { font-size: 14px; padding: 8px 12px; "
+            "border: 1px solid #d0d0d0; border-radius: 4px; background-color: #fafafa; }"
+            "QLineEdit:focus, QComboBox:focus { border-color: #4A90D9; background-color: #ffffff; }"
+        )
+
+        # 字段名下拉（可编辑，允许手输新字段名）
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setMinimumWidth(140)
+        combo.setMaximumWidth(180)
+        combo.setStyleSheet(input_style)
+        combo.addItems(self.CUSTOM_FIELD_OPTIONS)
+        if field_name:
+            idx = combo.findText(field_name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.setEditText(field_name)
+        else:
+            combo.setCurrentIndex(0)
+
+        # 字段值输入框
+        line_edit = QLineEdit(field_value)
+        line_edit.setStyleSheet(input_style)
+        line_edit.setPlaceholderText("请输入值")
+
+        # 删除按钮
+        del_btn = QPushButton("✕")
+        del_btn.setCursor(Qt.PointingHandCursor)
+        del_btn.setFixedSize(28, 28)
+        del_btn.setStyleSheet(
+            "QPushButton { font-size: 14px; color: #dc2626; background: transparent; "
+            "border: 1px solid #fca5a5; border-radius: 4px; }"
+            "QPushButton:hover { background: #fef2f2; }"
+        )
+
+        row_layout.addWidget(combo)
+        row_layout.addWidget(line_edit, 1)
+        row_layout.addWidget(del_btn)
+
+        self._custom_fields_container.addWidget(row_widget)
+        entry = (combo, line_edit, del_btn, row_widget)
+        self._custom_field_rows.append(entry)
+
+        # 信号连接：编辑时触发防抖保存
+        combo.currentTextChanged.connect(self._schedule_person_info_save)
+        line_edit.textChanged.connect(self._schedule_person_info_save)
+        del_btn.clicked.connect(lambda checked=False, e=entry: self._remove_custom_field_row(e))
+
+    def _remove_custom_field_row(self, entry):
+        """删除一行自定义字段。"""
+        combo, line_edit, del_btn, row_widget = entry
+        if entry in self._custom_field_rows:
+            self._custom_field_rows.remove(entry)
+        self._custom_fields_container.removeWidget(row_widget)
+        row_widget.deleteLater()
+        # 触发保存
+        self._schedule_person_info_save()
+
+    def _on_add_custom_field(self):
+        """点击"添加字段"按钮：新增一行空白自定义字段。"""
+        self._add_custom_field_row()
+        self._schedule_person_info_save()
+
+    def _serialize_custom_fields(self) -> str:
+        """将当前自定义字段行序列化为 JSON 字符串。"""
+        import json
+        fields = []
+        fixed_widgets = [
+            ("民族", getattr(self, "le_ethnicity", None)),
+            ("籍贯", getattr(self, "le_native_place", None)),
+            ("出生日期", getattr(self, "le_birth_date", None)),
+        ]
+        for fn, widget in fixed_widgets:
+            if widget is None:
+                continue
+            fv = widget.text().strip()
+            if fv:
+                fields.append({"field_name": fn, "field_value": fv})
+        for combo, line_edit, _del_btn, _row_widget in self._custom_field_rows:
+            fn = combo.currentText().strip()
+            fv = line_edit.text().strip()
+            if fn and fn not in self.FIXED_CUSTOM_FIELD_NAMES:
+                fields.append({"field_name": fn, "field_value": fv})
+        return json.dumps(fields, ensure_ascii=False) if fields else ""
+
+    # === 方案A：pending 状态 & 预览渲染 ===
+    def _current_image_ctx(self):
+        """
+        返回当前选中图片的上下文：
+        - img_id: 当前列表项对应记录 ID（可能是 original 或 retouched）
+        - file_path: 当前列表项显示的文件路径（通常是“优先修图版”的路径）
+        - orig_id: 该图片归属的 original_id（用于 pending 归一化）
+        - base_path: 当前编辑基线路径（优先修图版；若无修图版则为原图）
+        """
+        items = self.image_list.selectedItems()
+        if not items:
+            return None, None, None, None
+        it = items[0]
+        img_id = it.data(Qt.UserRole)
+        file_path = it.data(Qt.UserRole + 1) or ""
+        orig_id = it.data(Qt.UserRole + 2) or None
+        base_path = it.data(Qt.UserRole + 3) or ""
+        return img_id, file_path, orig_id, base_path
+
+    def _pending_for(self, orig_id: int):
+        p = self._pending_edits.get(orig_id)
+        if not p:
+            p = new_pending()
+            self._pending_edits[orig_id] = p
+        return p
+
+    def _set_dirty_badge(self, orig_id: Optional[int]):
+        if not hasattr(self, "lbl_img_dirty"):
+            return
+        if not orig_id:
+            self.lbl_img_dirty.setText("")
+            return
+        p = self._pending_edits.get(orig_id)
